@@ -417,18 +417,26 @@ str_find(const char *name) {
 static struct str *
 str_create(const char *name, const char *body) {
     struct str *s = str_find(name);
-    if (s == NULL) {
-        if (nstrs >= MAX_STRINGS) {
-            return NULL;
-        }
+    int is_new = s == NULL;
+    char *old_body = NULL;
+
+    if (s != NULL) {
+        old_body = s->body;
+        s->body = NULL;
+    } else {
+        if (nstrs >= MAX_STRINGS) { return NULL; }
         s = &strs[nstrs++];
         s->name = strdup(name);
-        if (s->name == NULL) return NULL;
-    } else {
-        free(s->body);
+        if (s->name == NULL) { nstrs--; return NULL; }
     }
+
     s->body = strdup(body);
-    if (s->body == NULL) return NULL;
+    if (s->body == NULL) {
+        if (is_new) { free(s->name); nstrs--; }
+        else        { s->body = old_body; }
+        return NULL;
+    }
+    free(old_body);
     s->ptr = 0;
     return s;
 }
@@ -492,7 +500,7 @@ static int  active_has(size_t n)             { return alen >= n; }
 // active_consume - remove n characters from front of active buffer
 static void
 active_consume(size_t n) {
-    if (n > alen) n = alen;
+    if (n > alen) { n = alen; }
     memmove(active, active + n, alen - n + 1);
     alen -= n;
 }
@@ -500,7 +508,7 @@ active_consume(size_t n) {
 // active_prepend - insert string at front (for rescanning results)
 static void
 active_prepend(const char *s, size_t len) {
-    if (len + alen >= MAX_BUF) return;
+    if (len + alen >= MAX_BUF) { return; }
     memmove(active + len, active, alen + 1);
     memcpy(active, s, len);
     alen += len;
@@ -580,27 +588,23 @@ static int has_marks(void) { return nmarks > 0; }
 // ---------------------------------------------------------------------------
 
 // num_parse - extract numeric value and prefix length from string
+//
+// Scans from end backwards: consumes trailing digits, then consumes
+// an optional sign. Everything before is the non-numeric prefix.
 static long
 num_parse(const char *s, size_t *prefix) {
     size_t len = strlen(s);
+
     if (len == 0) {
         *prefix = 0;
         return 0;
     }
 
-    // Scan backwards to find start of numeric suffix
-    size_t start = len;
-    for (size_t i = len; i > 0; i--) {
-        size_t k = i - 1;
-        if (is_digit(s[k])) {
-            start = k;
-        } else if (is_sign(s[k]) && i < len && is_digit(s[i])) {
-            start = k;
-            break;
-        } else {
-            break;
-        }
-    }
+    size_t end = len;
+    while (end > 0 && is_digit(s[end - 1])) { end--; }
+
+    size_t start = end;
+    if (start > 0 && is_sign(s[start - 1])) { start--; }
 
     *prefix = start;
     return (start == len) ? 0 : strtol(s + start, NULL, 10);
@@ -613,12 +617,19 @@ num_val(const char *s) {
     return num_parse(s, &prefix);
 }
 
+// has_prefix_room - check prefix fits in output before digits
+static int
+has_prefix_room(size_t plen, size_t outsz) {
+    return plen > 0 && plen < outsz - INT64_DIGITS;
+}
+
 // num_format - format result with original prefix preserved
 static void
 num_format(char *out, size_t sz, const char *a, long val) {
     size_t plen;
+
     num_parse(a, &plen);
-    if (plen > 0 && plen < sz - INT64_DIGITS) {
+    if (has_prefix_room(plen, sz)) {
         memcpy(out, a, plen);
         snprintf(out + plen, sz - plen, "%ld", val);
     } else {
@@ -670,7 +681,7 @@ typedef void (*builtin_fn)(char**, size_t, char*, size_t, int*);
 static void \
 name(char **a, size_t n, char *out, size_t sz, int *ra) { \
     (void)ra; out[0] = '\0'; \
-    if (n < 2) return; \
+    if (n < 2) { return; }\
     size_t p1, p2; \
     num_format(out, sz, a[0], num_parse(a[0], &p1) op num_parse(a[1], &p2)); \
 }
@@ -705,7 +716,7 @@ static void
 b_ds(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)sz; (void)ra;
     out[0] = '\0';
-    if (n >= 1) str_create(a[0], n > 1 ? a[1] : "");
+    if (n >= 1) { str_create(a[0], n > 1 ? a[1] : ""); }
 }
 
 // b_mp - #(mp,name,p1,p2,...) - make parameters
@@ -719,17 +730,19 @@ static void
 b_mp(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)sz; (void)ra;
     out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
 
     struct str *s = str_find(a[0]);
-    if (s == NULL) return;
+    if (s == NULL) { return; }
 
     char *body = s->body;
     size_t blen = strlen(body);
 
     for (size_t pi = 1; pi < n && pi < MAX_ARGS; pi++) {
-        if (is_empty_pattern(a[pi])) continue;
-        replace_text_with_marker(body, &blen, a[pi], strlen(a[pi]), (unsigned char)(PARAM_BASE + pi));
+        if (is_empty_pattern(a[pi])) { continue; }
+
+        unsigned char marker = (unsigned char)(PARAM_BASE + pi);
+        replace_text_with_marker(body, &blen, a[pi], strlen(a[pi]), marker);
     }
     s->ptr = 0;
 }
@@ -740,9 +753,9 @@ static void
 b_gs(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra;
     out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
     struct str *s = str_find(a[0]);
-    if (s) params_fill(out, sz, s->body, a + 1, n - 1);
+    if (s) { params_fill(out, sz, s->body, a + 1, n - 1); }
 }
 
 // b_go - #(go,name,z) - get one character
@@ -750,7 +763,7 @@ b_gs(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_go(char **a, size_t n, char *out, size_t sz, int *ra) {
     out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
 
     struct str *s = str_find(a[0]);
     if (s == NULL || str_exhausted(s)) {
@@ -766,10 +779,10 @@ b_go(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_gn(char **a, size_t n, char *out, size_t sz, int *ra) {
     out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
 
     long d = num_val(a[1]);
-    if (d == 0) return;
+    if (d == 0) { return; }
     size_t ud = d > 0 ? (size_t)d : 0;
 
     struct str *s = str_find(a[0]);
@@ -790,7 +803,7 @@ b_gn(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_fm(char **a, size_t n, char *out, size_t sz, int *ra) {
     out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
 
     struct str *s = str_find(a[0]);
     if (s == NULL) {
@@ -800,23 +813,26 @@ b_fm(char **a, size_t n, char *out, size_t sz, int *ra) {
 
     const char *pat = a[1];
     size_t plen = strlen(pat);
-    if (is_empty_pattern(pat)) return;
+    if (is_empty_pattern(pat)) { return; }
 
+    // Search from current pointer position
     size_t blen = strlen(s->body);
     size_t found = blen;
 
     for (size_t i = s->ptr; i + plen <= blen; i++) {
-        if (has_marker_at(s->body, i, plen)) continue;
+        if (has_marker_at(s->body, i, plen)) { continue; }
         if (memcmp(s->body + i, pat, plen) == 0) { found = i; break; }
     }
 
+    // Not found, return fallback
     if (found == blen) {
         if (n > 2) { strncpy(out, a[2], sz - 1); out[sz-1] = '\0'; *ra = 1; }
         return;
     }
 
+    // Return text from pointer to match, advance past pattern
     size_t len = found - s->ptr;
-    if (len >= sz) len = sz - 1;
+    if (len >= sz) { len = sz - 1; }
     memcpy(out, s->body + s->ptr, len);
     out[len] = '\0';
     s->ptr = found + plen;
@@ -829,7 +845,7 @@ b_rs(char **a, size_t n, char *out, size_t sz, int *ra) {
     out[0] = '\0';
     if (n >= 1) {
         struct str *s = str_find(a[0]);
-        if (s) str_reset(s);
+        if (s) { str_reset(s); }
     }
 }
 
@@ -850,12 +866,12 @@ static void
 b_si(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)sz; (void)ra;
     out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     struct str *s = str_find(a[0]);
-    if (s == NULL) return;
+    if (s == NULL) { return; }
 
     long c = num_val(a[1]);
-    if (c <= 0) return;
+    if (c <= 0) { return; }
 
     size_t idx = (size_t)(c - 1);
     if (idx < strlen(s->body)) {
@@ -877,7 +893,7 @@ arith2(b_xor, ^)
 static void
 b_div(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     size_t p1, p2;
     long x = num_parse(a[0], &p1), y = num_parse(a[1], &p2);
     num_format(out, sz, a[0], y == 0 ? 0 : x / y);
@@ -887,7 +903,7 @@ b_div(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_mod(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     size_t p1, p2;
     long x = num_parse(a[0], &p1), y = num_parse(a[1], &p2);
     num_format(out, sz, a[0], y == 0 ? 0 : x % y);
@@ -899,7 +915,7 @@ b_mod(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_gt(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     size_t p1, p2;
     truth_out(out, sz, num_parse(a[0], &p1) > num_parse(a[1], &p2), a, n);
 }
@@ -908,7 +924,7 @@ b_gt(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_eq(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     truth_out(out, sz, eq(a[0], a[1]), a, n);
 }
 
@@ -916,7 +932,7 @@ b_eq(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_lt(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     truth_out(out, sz, strcmp(a[0], a[1]) < 0, a, n);
 }
 
@@ -934,7 +950,7 @@ b_nc(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_nq(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
     const char *r = has_string(a[0]) ? (n > 1 ? a[1] : "") : (n > 2 ? a[2] : "");
     strncpy(out, r, sz - 1); out[sz - 1] = '\0';
 }
@@ -944,13 +960,14 @@ static void
 b_ls(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra;
     out[0] = '\0';
+
     const char *sep = n > 0 ? a[0] : "";
     const char *pre = n > 1 ? a[1] : "";
     size_t j = 0;
     int first = 1;
 
     for (size_t i = 0; i < nstrs && j < sz - 1; i++) {
-        if (!starts(strs[i].name, pre)) continue;
+        if (!starts(strs[i].name, pre)) { continue; }
         if (!first) {
             safe_append(out, &j, sz, sep, strlen(sep));
         }
@@ -963,12 +980,29 @@ b_ls(char **a, size_t n, char *out, size_t sz, int *ra) {
 // val_from_base - parse string v in given base (A=ascii, D/H/O/B)
 static long
 val_from_base(const char *v, char base) {
-    if (base == 'A') return v[0] ? (unsigned char)v[0] : 0;
-    if (base == 'D') return strtol(v, NULL, 10);
-    if (base == 'H') return strtol(v, NULL, 16);
-    if (base == 'O') return strtol(v, NULL, 8);
-    if (base == 'B') return strtol(v, NULL, 2);
+    if (base == 'A') { return v[0] ? (unsigned char)v[0] : 0; }
+    if (base == 'D') { return strtol(v, NULL, 10); }
+    if (base == 'H') { return strtol(v, NULL, 16); }
+    if (base == 'O') { return strtol(v, NULL, 8); }
+    if (base == 'B') { return strtol(v, NULL, 2); }
     return 0;
+}
+
+// fmt_binary - format value as binary string with optional negative sign
+static void
+fmt_binary(long val, char *out, size_t sz) {
+    if (val == 0) { out[0] = '0'; out[1] = '\0'; return; }
+
+    char tmp[65];
+    int i = 0;
+    unsigned long u = val < 0 ? (unsigned long)-val : (unsigned long)val;
+
+    while (u && i < 64) { tmp[i++] = '0' + (u & 1); u >>= 1; }
+
+    size_t j = 0;
+    if (val < 0 && j < sz - 1) { out[j++] = '-'; }
+    while (i > 0 && j < sz - 1) out[j++] = tmp[--i];
+    out[j] = '\0';
 }
 
 // fmt_to_base - format value to given base (A=ascii, D/H/O/B)
@@ -978,16 +1012,7 @@ fmt_to_base(long val, char base, char *out, size_t sz) {
     else if (base == 'D') snprintf(out, sz, "%ld", val);
     else if (base == 'H') snprintf(out, sz, "%lX", val);
     else if (base == 'O') snprintf(out, sz, "%lo", val);
-    else if (base == 'B') {
-        if (val == 0) { out[0] = '0'; out[1] = '\0'; return; }
-        char tmp[65]; int i = 0;
-        unsigned long u = val < 0 ? (unsigned long)-val : (unsigned long)val;
-        while (u && i < 64) { tmp[i++] = '0' + (u & 1); u >>= 1; }
-        size_t j = 0;
-        if (val < 0 && j < sz - 1) out[j++] = '-';
-        while (i > 0 && j < sz - 1) out[j++] = tmp[--i];
-        out[j] = '\0';
-    }
+    else if (base == 'B') { fmt_binary(val, out, sz); }
 }
 
 // b_bc - #(bc,value,from,to) - base conversion
@@ -995,7 +1020,7 @@ fmt_to_base(long val, char base, char *out, size_t sz) {
 static void
 b_bc(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
     char from = (char)(n > 1 && a[1][0] ? toupper((unsigned char)a[1][0]) : 'A');
     char to   = (char)(n > 2 && a[2][0] ? toupper((unsigned char)a[2][0]) : 'D');
     long val = val_from_base(a[0], from);
@@ -1012,7 +1037,7 @@ cmp_str(const void *x, const void *y) {
 static void
 b_sa(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; out[0] = '\0';
-    if (n == 0) return;
+    if (n == 0) { return; }
 
     char *sorted[MAX_ARGS];
     for (size_t i = 0; i < n && i < MAX_ARGS; i++) sorted[i] = a[i];
@@ -1020,7 +1045,7 @@ b_sa(char **a, size_t n, char *out, size_t sz, int *ra) {
 
     size_t j = 0;
     for (size_t i = 0; i < n && j < sz - 1; i++) {
-        if (i > 0 && j < sz - 1) out[j++] = ',';
+        if (i > 0 && j < sz - 1) { out[j++] = ','; }
         safe_append(out, &j, sz, sorted[i], strlen(sorted[i]));
     }
     out[j] = '\0';
@@ -1041,7 +1066,7 @@ static void
 b_rf(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra;
     out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
     FILE *f = fopen(a[0], "rb");
     if (f == NULL) { strncpy(out, "File not found", sz - 1); out[sz-1] = '\0'; return; }
     size_t pos = 0;
@@ -1057,7 +1082,7 @@ static void
 b_wf(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra;
     out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     FILE *f = fopen(a[0], "wb");
     if (f == NULL) { strncpy(out, "Write error", sz - 1); out[sz-1] = '\0'; return; }
     fwrite(a[1], 1, strlen(a[1]), f);
@@ -1070,7 +1095,7 @@ static void
 b_rn(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra;
     out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     if (rename(a[0], a[1]) != 0) {
         strncpy(out, "Rename error", sz - 1); out[sz-1] = '\0';
     }
@@ -1082,7 +1107,7 @@ static void
 b_de(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra;
     out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
     if (unlink(a[0]) != 0) {
         strncpy(out, "File not found", sz - 1); out[sz-1] = '\0';
     }
@@ -1094,7 +1119,7 @@ static void
 b_ff(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra;
     out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
     glob_t g;
     int ret = glob(a[0], 0, NULL, &g);
     if (ret != 0) { out[0] = '\0'; return; }
@@ -1110,24 +1135,32 @@ b_ff(char **a, size_t n, char *out, size_t sz, int *ra) {
     globfree(&g);
 }
 
+// TIME_FORMAT - standard strftime format for timestamps
+#define TIME_FORMAT "%a %b %d %H:%M:%S %Y"
+
+// format_time - write current time or time_t to out buffer
+static void
+format_time(const time_t *tp, char *out, size_t sz) {
+    struct tm *t = tp ? localtime(tp) : NULL;
+
+    if (t == NULL) { out[0] = '\0'; return; }
+    strftime(out, sz, TIME_FORMAT, t);
+}
+
 // b_ct - #(ct,F) - current time, or file modification time
 static void
 b_ct(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra;
     out[0] = '\0';
     if (n > 0 && a[0][0] != '\0') {
-        // File modification time
         struct stat st;
         if (stat(a[0], &st) == 0) {
-            struct tm *t = localtime(&st.st_mtime);
-            if (t) strftime(out, sz - 1, "%a %b %d %H:%M:%S %Y", t);
+            format_time(&st.st_mtime, out, sz);
         }
         return;
     }
-    // Current time
     time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    if (t) strftime(out, sz - 1, "%a %b %d %H:%M:%S %Y", t);
+    format_time(&now, out, sz);
 }
 
 // b_ex - #(ex,prog,args,stdin,stdout,stderr) - execute program
@@ -1136,13 +1169,16 @@ static void
 b_ex(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra;
     out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
+
     const char *prog = a[0];
     const char *args = n > 1 ? a[1] : "";
     char cmd[MAX_BUF];
+
     snprintf(cmd, sizeof(cmd), "%s %s", prog, args);
     FILE *p = popen(cmd, "r");
     if (p == NULL) { strncpy(out, "Exec error", sz - 1); out[sz-1] = '\0'; return; }
+
     size_t pos = 0;
     int c;
     while ((c = fgetc(p)) != EOF && pos < sz - 1) out[pos++] = (char)c;
@@ -1163,7 +1199,7 @@ ll_putlen(FILE *f, size_t n) {
 static size_t
 ll_getlen(FILE *f) {
     int b0 = getc(f), b1 = getc(f), b2 = getc(f), b3 = getc(f);
-    if (b0 == EOF || b1 == EOF || b2 == EOF || b3 == EOF) return ~(size_t)0;
+    if (b0 == EOF || b1 == EOF || b2 == EOF || b3 == EOF) { return ~(size_t)0; }
     return (size_t)(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
 }
 
@@ -1174,9 +1210,9 @@ static void
 b_ll(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; (void)sz;
     out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
     FILE *f = fopen(a[0], "rb");
-    if (f == NULL) return;
+    if (f == NULL) { return; }
     char magic[4];
     if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MINT", 4) != 0) { fclose(f); return; }
     size_t nstr = ll_getlen(f);
@@ -1203,7 +1239,7 @@ static void
 b_sl(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra;
     out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     FILE *f = fopen(a[0], "wb");
     if (f == NULL) { strncpy(out, "Write error", sz - 1); out[sz-1] = '\0'; return; }
     fwrite("MINT", 1, 4, f);
@@ -1244,8 +1280,8 @@ static struct {
 // SIDEFF: modifies editor buffer
 static void
 ed_insert_at(size_t pos, const char *s, size_t slen) {
-    if (pos > ed.len) pos = ed.len;
-    if (ed.len + slen >= MAX_BUF_SIZE) slen = MAX_BUF_SIZE - ed.len - 1;
+    if (pos > ed.len) { pos = ed.len; }
+    if (ed.len + slen >= MAX_BUF_SIZE) { slen = MAX_BUF_SIZE - ed.len - 1; }
     memmove(ed.text + pos + slen, ed.text + pos, ed.len - pos + 1);
     memcpy(ed.text + pos, s, slen);
     ed.len += slen;
@@ -1262,9 +1298,9 @@ ed_region(size_t *start, size_t *end) {
 // SIDEFF: modifies editor buffer
 static void
 ed_delete_range(size_t from, size_t to) {
-    if (from > ed.len) from = ed.len;
-    if (to > ed.len) to = ed.len;
-    if (to <= from) return;
+    if (from > ed.len) { from = ed.len; }
+    if (to > ed.len) { to = ed.len; }
+    if (to <= from) { return; }
     memmove(ed.text + from, ed.text + to, ed.len - to + 1);
     ed.len -= to - from;
 }
@@ -1272,22 +1308,40 @@ ed_delete_range(size_t from, size_t to) {
 // --- Buffer builtins ---
 
 // b_ba - #(ba,N) - buffer allocate: set buffer size ceiling or reset
+// is_clear_request - check if buffer reset requested (N <= 0 or missing)
+static int
+is_clear_request(long N) {
+    return N <= 0;
+}
+
+// b_ba - #(ba,N) - buffer allocate: set buffer size ceiling or reset
 static void
 b_ba(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; (void)sz; out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
+
     long N = num_val(a[0]);
-    if (N <= 0) { ed.len = 0; ed.point = 0; ed.mark = 0; return; }
+    if (is_clear_request(N)) {
+        ed.len = 0; ed.point = 0; ed.mark = 0;
+        return;
+    }
+
+    // Cap at MAX_BUF_SIZE-1 to guarantee room for null terminator
     size_t cap = (size_t)N;
-    if (cap > MAX_BUF_SIZE) cap = MAX_BUF_SIZE;
+    if (cap > MAX_BUF_SIZE - 1) { cap = MAX_BUF_SIZE - 1; }
+
+    // Extend, shrink, or keep — then null-terminate
     if (cap > ed.len) {
-        memset(ed.text + ed.len, 0, cap - ed.len + 1);
-    } else if (cap < ed.len) {
-        ed.len = ed.text[cap] = '\0';
+        memset(ed.text + ed.len, 0, cap - ed.len);
+    }
+    if (cap < ed.len) {
+        ed.len = cap;
     }
     ed.len = cap;
-    if (ed.point > ed.len) ed.point = ed.len;
-    if (ed.mark > ed.len) ed.mark = ed.len;
+    ed.text[ed.len] = '\0';
+
+    if (ed.point > ed.len) { ed.point = ed.len; }
+    if (ed.mark > ed.len) { ed.mark = ed.len; }
 }
 
 // b_bi - #(bi,N,M,E) - buffer insert: insert string E into buffer at pos M
@@ -1295,9 +1349,9 @@ b_ba(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_bi(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; (void)sz; out[0] = '\0';
-    if (n < 3) return;
+    if (n < 3) { return; }
     long M = num_val(a[1]);
-    if (M < 0) M = 0;
+    if (M < 0) { M = 0; }
     ed_insert_at((size_t)M, a[2], strlen(a[2]));
 }
 
@@ -1306,7 +1360,7 @@ b_bi(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_is(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; (void)sz; out[0] = '\0';
-    if (n < 2) return;                           // #(is,S,E) — need both args
+    if (n < 2) { return; }  // #(is,S,E) — need both args
     size_t slen = strlen(a[1]);
     ed_insert_at(ed.point, a[1], slen);
     ed.point += slen;
@@ -1317,18 +1371,21 @@ b_is(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_tr(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; out[0] = '\0';
+
     size_t start, end;
     ed_region(&start, &end);
+
     const char *repl = n > 1 ? a[1] : "";
     size_t rlen = strlen(repl);
+
     if (start < end) {
-        // Capture replaced text as return value
         size_t clen = end - start;
-        if (clen >= sz) clen = sz - 1;
+        if (clen >= sz) { clen = sz - 1; }
         memcpy(out, ed.text + start, clen);
         out[clen] = '\0';
         ed_delete_range(start, end);
     }
+
     ed_insert_at(start, repl, rlen);
     ed.point = start + rlen;
 }
@@ -1341,7 +1398,7 @@ b_dm(char **a, size_t n, char *out, size_t sz, int *ra) {
     size_t start, end;
     ed_region(&start, &end);
     size_t clen = end - start;
-    if (clen >= sz) clen = sz - 1;
+    if (clen >= sz) { clen = sz - 1; }
     memcpy(out, ed.text + start, clen);
     out[clen] = '\0';
     ed_delete_range(start, end);
@@ -1350,15 +1407,26 @@ b_dm(char **a, size_t n, char *out, size_t sz, int *ra) {
 
 // --- Mark operations ---
 
+// is_push_op - check if operation is "push"
+static int
+is_push_op(const char *op) { return eq(op, "push"); }
+
+// is_pop_op - check if operation is "pop"
+static int
+is_pop_op(const char *op)  { return eq(op, "pop"); }
+
 // b_pm - #(pm,S,E) - push/pop mark ring
 // S='push': push current point onto mark ring. S='pop': pop top of ring.
 static void
 b_pm(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; out[0] = '\0';
-    if (n < 1) return;
-    if (eq(a[0], "push")) {
-        if (ed.nmarks < MAX_MARKS) ed.marks[ed.nmarks++] = ed.point;
-    } else if (eq(a[0], "pop")) {
+    if (n < 1) { return; }
+
+    if (is_push_op(a[0])) {
+        if (ed.nmarks < MAX_MARKS) { ed.marks[ed.nmarks++] = ed.point; }
+        return;
+    }
+    if (is_pop_op(a[0])) {
         if (ed.nmarks > 0) {
             ed.point = ed.marks[--ed.nmarks];
             snprintf(out, sz, "%zu", ed.point);
@@ -1370,7 +1438,7 @@ b_pm(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_sm(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; (void)sz; out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     long V = num_val(a[1]);
     ed.mark = V < 0 ? 0 : (size_t)V;
 }
@@ -1379,10 +1447,10 @@ b_sm(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_sp(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; (void)sz; out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
     long M = num_val(a[0]);
     ed.point = M < 0 ? 0 : (size_t)M;
-    if (ed.point > ed.len) ed.point = ed.len;
+    if (ed.point > ed.len) { ed.point = ed.len; }
 }
 
 // b_rm - #(rm,M,V) - read mark M, set it to V (0-based), return old value
@@ -1390,7 +1458,7 @@ static void
 b_rm(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra;
     out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     long V = num_val(a[1]);
     snprintf(out, sz, "%zu", ed.mark);
     ed.mark = V < 0 ? 0 : (size_t)V;
@@ -1425,9 +1493,9 @@ b_mb(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_an(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; (void)sz; out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     long L = num_val(a[0]);
-    if (L == 0) fprintf(stderr, "%s", a[1]);
+    if (L == 0) { fprintf(stderr, "%s", a[1]); }
 }
 
 // --- Display stubs ---
@@ -1443,7 +1511,7 @@ b_rd(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_xy(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; (void)sz; out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     ed.scrx = (int)num_val(a[0]);
     ed.scry = (int)num_val(a[1]);
 }
@@ -1453,7 +1521,7 @@ static void
 b_ow(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; (void)sz;
     out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
     fprintf(stderr, "%s", a[0]);
 }
 
@@ -1487,7 +1555,7 @@ search_forward(const char *pat, size_t plen, char *out, size_t sz) {
 static int
 search_backward(const char *pat, size_t plen, char *out, size_t sz) {
     size_t end = ed.point + plen;
-    if (end > ed.len) end = ed.len;
+    if (end > ed.len) { end = ed.len; }
     for (size_t i = end; i >= plen; i--) {
         size_t pos = i - plen;
         if (pos < ed.point && memcmp(ed.text + pos, pat, plen) == 0) {
@@ -1503,10 +1571,10 @@ search_backward(const char *pat, size_t plen, char *out, size_t sz) {
 static void
 b_lp(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
     const char *pat = a[0];
     size_t plen = strlen(pat);
-    if (search_impossible(plen, ed.len)) return;
+    if (search_impossible(plen, ed.len)) { return; }
     if (search_dir_is_backward(a, n)) {
         search_backward(pat, plen, out, sz);
     } else {
@@ -1527,21 +1595,15 @@ b_lk(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_lq(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; out[0] = '\0';
-    if (n < 1) return;
-    const char *pat = a[0];
-    size_t plen = strlen(pat);
-    size_t found = ed.len;
-    for (size_t i = ed.point; i + plen <= ed.len; i++) {
-        if (memcmp(ed.text + i, pat, plen) == 0) { found = i; break; }
-    }
-    if (found < ed.len) {
-        ed.point = found + plen;
-        const char *y = n > 4 ? a[4] : "";
-        strncpy(out, y, sz - 1); out[sz-1] = '\0';
-    } else {
-        const char *nval = n > 5 ? a[5] : "";
-        strncpy(out, nval, sz - 1); out[sz-1] = '\0';
-    }
+    if (n < 1) { return; }
+
+    size_t plen = strlen(a[0]);
+    char posbuf[INT64_DIGITS];
+    int found = search_forward(a[0], plen, posbuf, sizeof(posbuf));
+
+    const char *r = found ? (n > 4 ? a[4] : "") : (n > 5 ? a[5] : "");
+    strncpy(out, r, sz - 1);
+    out[sz - 1] = '\0';
 }
 
 // --- Environment ---
@@ -1552,13 +1614,17 @@ static void
 b_ev(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; (void)a; (void)n; (void)sz;
     out[0] = '\0';
+
     extern char **environ;
     char ename[MAX_BUF];
+
     for (char **e = environ; e && *e; e++) {
         const char *eq = strchr(*e, '=');
-        if (eq == NULL) continue;
+        if (eq == NULL) { continue; }
+
         size_t evlen = (size_t)(eq - *e);
-        if (evlen + 4 >= MAX_BUF) continue;
+        if (evlen + 4 >= MAX_BUF) { continue; }
+
         memcpy(ename, "env.", 4);
         memcpy(ename + 4, *e, evlen);
         ename[4 + evlen] = '\0';
@@ -1586,9 +1652,9 @@ b_it(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_lv(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; (void)sz; out[0] = '\0';
-    if (n < 1) return;
+    if (n < 1) { return; }
     FILE *f = fopen(a[0], "rb");
-    if (f == NULL) return;
+    if (f == NULL) { return; }
     char buf[MAX_BUF];
     size_t pos = 0;
     int c;
@@ -1603,11 +1669,11 @@ b_lv(char **a, size_t n, char *out, size_t sz, int *ra) {
 static void
 b_sv(char **a, size_t n, char *out, size_t sz, int *ra) {
     (void)ra; (void)sz; out[0] = '\0';
-    if (n < 2) return;
+    if (n < 2) { return; }
     const char *file = a[0];               // #(sv,F,V) — F = filename
     const char *val  = a[1];               // V = value to write
     FILE *f = fopen(file, "wb");
-    if (f == NULL) return;
+    if (f == NULL) { return; }
     fwrite(val, 1, strlen(val), f);
     fclose(f);
 }
@@ -1697,7 +1763,7 @@ static void
 call_default(const char *name, char **a, size_t n, char *out, size_t sz) {
     out[0] = '\0';
     struct str *s = str_find(name);
-    if (s == NULL) return;
+    if (s == NULL) { return; }
 
     char *all[MAX_ARGS + 1];
     all[0] = (char *)name;
@@ -1709,12 +1775,11 @@ call_default(const char *name, char **a, size_t n, char *out, size_t sz) {
 static void
 call(const char *name, char **a, size_t n, char *out, size_t sz, int *ra) {
     *ra = 0;
+
     builtin_fn fn = builtin_find(name);
-    if (fn) {
-        fn(a, n, out, sz, ra);
-    } else {
-        call_default(name, a, n, out, sz);
-    }
+    if (fn) { fn(a, n, out, sz, ra); return; }
+
+    call_default(name, a, n, out, sz);
 }
 
 // ---------------------------------------------------------------------------
@@ -1734,7 +1799,7 @@ static size_t
 find_close(const char *s, size_t len) {
     int depth = 1;
     for (size_t i = 0; i < len; i++) {
-        if (is_open(s[i])) depth++;
+        if (is_open(s[i])) { depth++; }
         else if (is_close(s[i]) && --depth == 0) return i;
     }
     return len;
@@ -1785,10 +1850,10 @@ dispatch_call(struct marker m, char **args, size_t argc) {
 
     char result[MAX_BUF];
     int ra = 0;
+
+    result[0] = '\0';
     if (argc > 0) {
         call(args[0], args + 1, argc - 1, result, sizeof(result), &ra);
-    } else {
-        result[0] = '\0';
     }
 
     for (size_t i = 0; i < argc; i++) {
@@ -1796,7 +1861,7 @@ dispatch_call(struct marker m, char **args, size_t argc) {
     }
 
     size_t rlen = strlen(result);
-    if (m.rescan || ra) active_prepend(result, rlen);
+    if (m.rescan || ra) { active_prepend(result, rlen); }
     else neutral_append(result, rlen);
 }
 
@@ -1855,11 +1920,12 @@ static void
 scan(const char *input) {
     nlen = 0; neutral[0] = '\0';
     alen = strlen(input);
-    if (alen >= MAX_BUF) alen = MAX_BUF - 1;
+    if (alen >= MAX_BUF) { alen = MAX_BUF - 1; }
     memcpy(active, input, alen);
     active[alen] = '\0';
     nmarks = nargpos = 0;
 
+    // Dispatch loop — consume one token per iteration
     while (!active_empty()) {
         char c = active_peek();
 
@@ -1868,7 +1934,7 @@ scan(const char *input) {
             continue;
         }
         if (is_open(c)) {
-            if (handle_protection_paren()) return;
+            if (handle_protection_paren()) { return; }
             continue;
         }
         if (is_comma(c)) {
@@ -1889,7 +1955,7 @@ scan(const char *input) {
             continue;
         }
         if (is_close(c)) {
-            if (handle_function_end()) return;
+            if (handle_function_end()) { return; }
             continue;
         }
 
@@ -1909,7 +1975,7 @@ static char *
 slurp(FILE *f) {
     size_t cap = 4096, len = 0;
     char *buf = malloc(cap);
-    if (buf == NULL) return NULL;
+    if (buf == NULL) { return NULL; }
     int c;
     while ((c = fgetc(f)) != EOF) {
         if (len + 1 >= cap) {

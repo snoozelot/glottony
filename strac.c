@@ -154,6 +154,10 @@
 //     -- gap #1 = A, gap #2 = B
 //     -> outputs: X A Y B Z
 //
+// WARNING: Gap markers use bytes 0x01..0xFF. Any input byte in this range
+// stored in a form body is treated as a gap marker and silently replaced
+// during [cl,...]. Avoid non-printable bytes in form data.
+//
 // ============================================================================
 // COMPARISON: CONDITIONAL EXECUTION
 // ============================================================================
@@ -254,6 +258,7 @@ static int  emit_save(void)       { return olen; }
 static void
 emit_capture(int from, char *buf, int sz) {
     int len = olen - from;
+
     if (len >= sz) len = sz - 1;
     if (len > 0) memcpy(buf, out + from, len);
     buf[len] = '\0';
@@ -301,13 +306,16 @@ def_alloc(void) {
 static void
 def_store(const char *name, const char *val) {
     struct def *d = def_find(name);
+
     if (d == NULL) {
         d = def_alloc();
         if (d == NULL) return;
+
         strncpy(d->name, name, MAX_NAME - 1);
         d->name[MAX_NAME - 1] = '\0';
         d->used = 1;
     }
+
     strncpy(d->val, val, MAX_VAL - 1);
     d->val[MAX_VAL - 1] = '\0';
     d->gaps = 0;
@@ -321,7 +329,8 @@ static void def_reset(struct def *d)     { d->ptr = 0; }
 static int  def_exhausted(struct def *d) { return d->val[d->ptr] == '\0'; }
 static char def_read(struct def *d)      { return d->val[d->ptr++]; }
 static char def_peek(struct def *d)      { return d->val[d->ptr]; }
-static int  has_no_gaps(struct def *d)   { return d->gaps == 0; }
+static int  has_gaps(struct def *d)   { return d->gaps > 0; }
+static int  has_data(struct def *d)   { return d && !def_exhausted(d); }
 
 // ---------------------------------------------------------------------------
 // Number conversion - simple integer parsing and formatting
@@ -340,8 +349,10 @@ str_to_int(const char *s) {
 static void
 int_to_str(char *buf, int n) {
     if (n == 0) { buf[0] = '0'; buf[1] = '\0'; return; }
+
     int neg = n < 0;
     if (neg) { *buf++ = '-'; n = -n; }
+
     char tmp[32]; int i = 0;
     while (n > 0) { tmp[i++] = '0' + (n % 10); n /= 10; }
     while (i > 0) *buf++ = tmp[--i];
@@ -351,6 +362,24 @@ int_to_str(char *buf, int n) {
 // ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
+
+// copy_arg - copy at most MAX_VAL chars into dest, null-terminate
+static void
+copy_arg(char *dest, const char *src, int len) {
+    if (len >= MAX_VAL) len = MAX_VAL - 1;
+
+    strncpy(dest, src, len);
+    dest[len] = '\0';
+}
+
+// push_arg - copy one argument string and increment count
+static void
+push_arg(char args[][MAX_VAL], int *n, const char *src, int len) {
+    if (*n >= MAX_ARGS) return;
+
+    copy_arg(args[*n], src, len);
+    (*n)++;
+}
 
 // find_close - find matching ] accounting for nesting, returns index or -1
 static int
@@ -374,26 +403,14 @@ parse_args(const char *s, char args[][MAX_VAL], int *n) {
         if (is_open(s[i])) depth++;
         if (is_close(s[i])) depth--;
 
-        // Comma at depth 0 = argument separator
         if (depth == 0 && is_comma(s[i])) {
-            int len = i - start;
-            if (*n < MAX_ARGS) {
-                if (len > 0) { strncpy(args[*n], s + start, len); args[*n][len] = '\0'; }
-                else args[*n][0] = '\0';
-                (*n)++;
-            }
+            push_arg(args, n, s + start, i - start);
             start = i + 1;
         }
         i++;
     }
 
-    // Final argument
-    int len = i - start;
-    if (*n < MAX_ARGS) {
-        if (len > 0) { strncpy(args[*n], s + start, len); args[*n][len] = '\0'; }
-        else args[*n][0] = '\0';
-        (*n)++;
-    }
+    push_arg(args, n, s + start, i - start);
 }
 
 // ---------------------------------------------------------------------------
@@ -438,58 +455,108 @@ static void p_dd(char a[][MAX_VAL], int n) { if (n > 0) def_delete(a[0]); }
 // p_da - [da] - delete all definitions
 static void p_da(char a[][MAX_VAL], int n) { (void)a; (void)n; def_clear(); }
 
+// replace_gap - in result buffer, replace all bytes matching 'gap' with 'rep'
+static void
+replace_gap(char *result, char gap, const char *rep) {
+    int rlen = strlen(rep);
+    char tmp[MAX_VAL];
+    int ti = 0, i = 0;
+
+    while (result[i] && ti < MAX_VAL - rlen) {
+        if (result[i] == gap) {
+            strncpy(tmp + ti, rep, MAX_VAL - ti - 1);
+            ti += rlen;
+            i++;
+        } else {
+            tmp[ti++] = result[i++];
+        }
+    }
+    tmp[ti] = '\0';
+    strncpy(result, tmp, MAX_VAL - 1);
+}
+
+// fill_gaps - replace each gap marker in 'body' with corresponding arg
+static void
+fill_gaps(char *body, char a[][MAX_VAL], int n, int gap_count) {
+    int limit = n < gap_count ? n : gap_count;
+
+    for (int gi = 1; gi < limit; gi++) {
+        char gap = GAP_BASE + (gi - 1);
+        replace_gap(body, gap, a[gi]);
+    }
+}
+
 // p_cl - [cl,name,a1,a2,...] - call form
 // Retrieves form, fills gaps with arguments, evaluates result.
 static void
 p_cl(char a[][MAX_VAL], int n) {
     if (n == 0) return;
+
     struct def *d = def_find(a[0]);
     if (d == NULL) return;
 
-    // No gaps: just evaluate the value
-    if (has_no_gaps(d)) {
+    if (!has_gaps(d)) {
         char buf[MAX_VAL];
         strncpy(buf, d->val, MAX_VAL - 1);
         buf[MAX_VAL - 1] = '\0';
         eval(buf);
+
         return;
     }
 
-    // Fill gaps with arguments
-    // Gap marker 0x01 = arg 1, 0x02 = arg 2, etc.
     char result[MAX_VAL];
     strncpy(result, d->val, MAX_VAL - 1);
     result[MAX_VAL - 1] = '\0';
 
-    for (int gi = 1; gi < n && gi <= d->gaps; gi++) {
-        char gap = GAP_BASE + (gi - 1);
-        const char *rep = a[gi];
-        int rlen = strlen(rep);
-
-        char tmp[MAX_VAL];
-        int ti = 0, i = 0;
-        while (result[i] && ti < MAX_VAL - rlen) {
-            if (result[i] == gap) {
-                strncpy(tmp + ti, rep, MAX_VAL - ti - 1);
-                ti += rlen;
-                i++;
-            } else {
-                tmp[ti++] = result[i++];
-            }
-        }
-        tmp[ti] = '\0';
-        strncpy(result, tmp, MAX_VAL - 1);
-    }
-
+    fill_gaps(result, a, n, d->gaps + 1);
     eval(result);
+}
+
+// replace_pattern - in result, replace all 'pat' occurrences with 'gap' byte
+static void
+replace_pattern(char *result, const char *pat, int plen, char gap) {
+    char tmp[MAX_VAL];
+    int ti = 0, i = 0;
+
+    while (result[i] && ti < MAX_VAL - 1) {
+        if (starts(result + i, pat)) {
+            tmp[ti++] = gap;
+            i += plen;
+        } else {
+            tmp[ti++] = result[i++];
+        }
+    }
+    tmp[ti] = '\0';
+    strncpy(result, tmp, MAX_VAL - 1);
+}
+
+// sort_by_desc_length - sort index array by argument string length descending
+// order: array of indices into a, sorted in-place
+// n: number of elements to sort
+// a: string array to measure lengths from
+static void
+sort_by_desc_length(int *order, int n, char a[][MAX_VAL]) {
+    for (int i = 1; i < n; i++) {
+        int    key  = order[i];
+        size_t klen = strlen(a[key]);
+        int    j    = i - 1;
+
+        while (j >= 0 && strlen(a[order[j]]) < klen) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = key;
+    }
 }
 
 // p_ss - [ss,name,p1,p2,...] - segment string
 // Replaces occurrences of p1,p2,... in form with gap markers.
+// Replaces longest patterns first to prevent prefix masking.
 // SIDEFF: modifies form body and gaps count in-place
 static void
 p_ss(char a[][MAX_VAL], int n) {
     if (n < 2) return;
+
     struct def *d = def_find(a[0]);
     if (d == NULL) return;
 
@@ -497,23 +564,19 @@ p_ss(char a[][MAX_VAL], int n) {
     strncpy(result, d->val, MAX_VAL - 1);
     result[MAX_VAL - 1] = '\0';
 
-    for (int gi = 1; gi < n && gi <= MAX_GAPS; gi++) {
-        const char *pat = a[gi];
-        int plen = strlen(pat);
-        char gap = GAP_BASE + (gi - 1);
+    int npat = n - 1;
+    if (npat > MAX_GAPS) { npat = MAX_GAPS; }
 
-        char tmp[MAX_VAL];
-        int ti = 0, i = 0;
-        while (result[i] && ti < MAX_VAL - 1) {
-            if (starts(result + i, pat)) {
-                tmp[ti++] = gap;
-                i += plen;
-            } else {
-                tmp[ti++] = result[i++];
-            }
-        }
-        tmp[ti] = '\0';
-        strncpy(result, tmp, MAX_VAL - 1);
+    int order[MAX_GAPS];
+    for (int i = 0; i < npat; i++) { order[i] = i + 1; }
+    sort_by_desc_length(order, npat, a);
+
+    for (int i = 0; i < npat; i++) {
+        int    gi   = order[i];
+        size_t plen = strlen(a[gi]);
+
+        if (plen == 0) { continue; }
+        replace_pattern(result, a[gi], plen, GAP_BASE + (gi - 1));
     }
 
     d->gaps = n - 1;
@@ -585,16 +648,19 @@ static void
 p_cc(char a[][MAX_VAL], int n) {
     if (n == 0) return;
     struct def *d = def_find(a[0]);
-    if (d && !def_exhausted(d)) emit(def_read(d));
+    if (has_data(d)) emit(def_read(d));
 }
 
 // p_cn - [cn,name,count] - call n characters
 static void
 p_cn(char a[][MAX_VAL], int n) {
     if (n < 2) return;
+
     struct def *d = def_find(a[0]);
     if (d == NULL) return;
+
     int count = str_to_int(a[1]);
+
     for (int i = 0; i < count && !def_exhausted(d); i++) {
         emit(def_read(d));
     }
@@ -604,9 +670,11 @@ p_cn(char a[][MAX_VAL], int n) {
 static void
 p_cs(char a[][MAX_VAL], int n) {
     if (n == 0) return;
+
     struct def *d = def_find(a[0]);
     if (d == NULL) return;
-    while (!def_exhausted(d)) {
+
+    while (has_data(d)) {
         char c = def_peek(d);
         if (is_gap(c)) { d->ptr++; break; }
         emit(def_read(d));
@@ -618,10 +686,13 @@ p_cs(char a[][MAX_VAL], int n) {
 static void
 p_in(char a[][MAX_VAL], int n) {
     if (n < 2) return;
+
     struct def *d = def_find(a[0]);
     if (d == NULL) return;
+
     const char *pat = a[1];
     int plen = strlen(pat);
+
     while (!def_exhausted(d)) {
         if (starts(d->val + d->ptr, pat)) {
             d->ptr += plen;
@@ -695,6 +766,36 @@ handle_neutral(const char *text, int *i) {
     }
 }
 
+// eval_first_arg - evaluate text, capture into evaled[0]
+static void
+eval_first_arg(const char *text, char evaled[][MAX_VAL]) {
+    int saved = emit_save();
+    eval(text);
+    emit_capture(saved, evaled[0], MAX_VAL);
+}
+
+// eval_remaining_args - evaluate each arg, ds value arg not evaluated
+static int
+is_literal_val(int is_ds, int j) {
+    return is_ds && j == 2;
+}
+
+static void
+eval_remaining_args(char args[][MAX_VAL], char evaled[][MAX_VAL], int nargs) {
+    int is_ds = eq(evaled[0], "ds");
+
+    for (int j = 1; j < nargs; j++) {
+        if (is_literal_val(is_ds, j)) {
+            strncpy(evaled[j], args[j], MAX_VAL - 1);
+            evaled[j][MAX_VAL - 1] = '\0';
+        } else {
+            int saved = emit_save();
+            eval(args[j]);
+            emit_capture(saved, evaled[j], MAX_VAL);
+        }
+    }
+}
+
 // handle_call - [...] active call: eval args, dispatch primitive
 static void
 handle_call(const char *text, int *i) {
@@ -708,26 +809,11 @@ handle_call(const char *text, int *i) {
     char args[MAX_ARGS][MAX_VAL];
     int nargs;
     parse_args(content, args, &nargs);
-
     if (nargs == 0) { *i += end + 2; return; }
 
     char evaled[MAX_ARGS][MAX_VAL];
-    int saved = emit_save();
-    eval(args[0]);
-    emit_capture(saved, evaled[0], MAX_VAL);
-
-    int is_ds = eq(evaled[0], "ds");
-
-    for (int j = 1; j < nargs; j++) {
-        if (is_ds && j == 2) {
-            strncpy(evaled[j], args[j], MAX_VAL - 1);
-            evaled[j][MAX_VAL - 1] = '\0';
-        } else {
-            saved = emit_save();
-            eval(args[j]);
-            emit_capture(saved, evaled[j], MAX_VAL);
-        }
-    }
+    eval_first_arg(args[0], evaled);
+    eval_remaining_args(args, evaled, nargs);
 
     prim_fn fn = prim_find(evaled[0]);
     if (fn) fn(evaled + 1, nargs - 1);
@@ -756,20 +842,36 @@ eval(const char *text) {
 // Main - read input and run interpreter
 // ---------------------------------------------------------------------------
 
+// is_shebang - buffer starts with #! marker
+static int
+is_shebang(const char *buf, size_t n) {
+    return n >= 2 && buf[0] == '#' && buf[1] == '!';
+}
+
+// eval_after_shebang - evaluate content after shebang line, if any
+// SIDEFF: evaluates text after first newline
+static void
+eval_after_shebang(const char *buf) {
+    const char *nl = strchr(buf, '\n');
+
+    if (nl) {
+        eval(nl + 1);
+    }
+}
+
 // run - process file through interpreter
 static void
 run(FILE *f) {
     char buf[MAX_VAL];
-    size_t n;
     int first = 1;
+    size_t n;
 
     while ((n = fread(buf, 1, sizeof(buf) - 1, f)) > 0) {
         buf[n] = '\0';
-        // Skip shebang line if present
-        if (first && n >= 2 && buf[0] == '#' && buf[1] == '!') {
+
+        if (first && is_shebang(buf, n)) {
             first = 0;
-            char *nl = strchr(buf, '\n');
-            if (nl) eval(nl + 1);
+            eval_after_shebang(buf);
         } else {
             first = 0;
             eval(buf);
